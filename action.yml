@@ -1,0 +1,126 @@
+name: 'Netbird connect'
+description: 'Connect your workflow to your Netbird network'
+inputs:
+  setup-key:
+    description: 'Setup key obtained from the Management Service Dashboard (used to register peer)'
+    required: true
+  hostname:
+    description: 'Sets a custom hostname that is visible from Netbird Dashboard'
+    required: false
+    default: ''
+  management-url:
+    description: 'Management Service URL [http|https]://[host]:[port] (default "https://api.netbird.io:443")'
+    required: false
+    default: 'https://api.netbird.io:443'
+  args:
+    description: 'Optional additional arguments to `netbird up`'
+    required: false
+    default: ''
+outputs:
+  connected:
+    description: 'Whether Netbird is connected'
+    value: ${{ steps.connect.outputs.connected }}
+branding:
+  icon: 'bar-chart'
+  color: 'orange'
+runs:
+  using: 'composite'
+  steps:
+    - name: Check Runner OS
+      if: ${{ runner.os != 'Linux' }}
+      shell: bash
+      run: |
+        echo "::error title=error hint::Support Linux Only"
+        exit 1
+
+    - name: Initial peer-reachability check
+      id: pre
+      shell: bash
+      run: |
+        if ping -c 4 sg-nas.netbird.selfhosted &> /dev/null; then
+          echo "pre_connected=true" >> $GITHUB_OUTPUT
+        else
+          echo "pre_connected=false" >> $GITHUB_OUTPUT
+        fi
+
+    # Skip all of the install/start/up if we were already reachable
+    - name: Check if Netbird is installed
+      if: ${{ steps.pre.outputs.pre_connected == 'false' }}
+      id: check-netbird-installed
+      shell: bash
+      run: |
+        if command -v netbird &> /dev/null; then
+          echo "netbird_installed=true" >> $GITHUB_OUTPUT
+        else
+          echo "netbird_installed=false" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Download Netbird
+      if: |
+        steps.pre.outputs.pre_connected == 'false' &&
+        steps.check-netbird-installed.outputs.netbird_installed == 'false'
+      shell: bash
+      env:
+        USE_BIN_INSTALL: true
+      run: curl -fsSL https://pkgs.netbird.io/install.sh | sh
+
+    - name: Connect to Netbird
+      if: ${{ steps.pre.outputs.pre_connected == 'false' }}
+      shell: bash
+      env:
+        SETUP_KEY: ${{ inputs.setup-key }}
+        HOSTNAME: ${{ inputs.hostname }}
+        MANAGEMENT_URL: ${{ inputs.management-url }}
+        ADDITIONAL_ARGS: ${{ inputs.args }}
+      run: |
+        if [ -z "$HOSTNAME" ]; then
+          HOSTNAME="github-$(cat /etc/hostname)"
+        fi
+        sudo netbird service install || true
+        sudo netbird service start   || true
+        if ! sudo netbird up \
+          --setup-key="$SETUP_KEY" \
+          --hostname="$HOSTNAME" \
+          --management-url="$MANAGEMENT_URL" \
+          $ADDITIONAL_ARGS; then
+
+          echo "Netbird up failed. Trying service reset"
+          sudo netbird service uninstall || true
+          sudo netbird service install || true
+          sudo netbird service start || true
+
+          echo "Retrying netbird up after service reset"
+          sudo netbird up \
+            --setup-key="$SETUP_KEY" \
+            --hostname="$HOSTNAME" \
+            --management-url="$MANAGEMENT_URL" \
+            $ADDITIONAL_ARGS
+        fi
+
+    - name: Wait for Netbird to connect
+      if: ${{ steps.pre.outputs.pre_connected == 'false' }}
+      shell: bash
+      run: |
+        sleep 50
+        until sudo netbird status | grep -q 'Management: Connected'; do
+          echo "Waiting for Netbird to connect…"
+          sleep 5
+        done
+
+    - name: Final peer-reachability check
+      id: connect
+      shell: bash
+      run: |
+        for i in {1..10}; do
+          if ping -c 4 sg-nas.netbird.selfhosted &> /dev/null; then
+            echo "connected=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          sleep 10
+        done
+        echo "connected=false" >> $GITHUB_OUTPUT
+
+    - name: Fail if not connected
+      if: ${{ steps.connect.outputs.connected == 'false' }}
+      run: exit 1
+      shell: bash
